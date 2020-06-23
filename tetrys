@@ -1,0 +1,419 @@
+#!/usr/bin/python3
+
+import sys
+import random
+import csv
+from math import ceil
+from optparse import OptionParser
+
+from tetrominos import Tetromino
+import pygame_textinput
+import pygame
+import pygame.locals as pl
+
+
+WIDTH = 14
+HEIGHT = 20
+HIGHSCORE_FILE = 'highscore.csv'
+
+POINTS_FOR_LINES = (40, 100, 300, 1200)
+
+CELL_SIZE = 25
+SIDEBAR_WIDTH = 6
+EMPTY_CELL_COLOR = (20, 20, 20)
+TEXT_COLOR = (200, 200, 200)
+TEXT_HILIGHT_COLOR = (255, 0, 0)
+FINAL_POSITION_COLOR = (40, 40, 40)
+SHADOW_COLOR = (0, 0, 0, 175)
+SMALL_FONT = ('droidsansmono', 15)
+LARGE_FONT = ('droidsansmono', 45)
+SEPARATOR_TYPE = 'sep'
+
+FPS = 60
+KEY_FIRST_REPEAT_DELAY = 250
+KEY_REPEAT_INTERVAL = 15
+HARD_DROP_ANIMATION_TIME = 200
+
+DROP_EVENT = pygame.USEREVENT
+
+class GameState:
+    READY, RUNNING, ANIMATING, PAUSED, LOST_HISCORE, LOST_DONE = range(6)
+
+class Game:
+    def __init__(self, width, height, highscore_file):
+        pygame.init()
+        pygame.display.set_caption('Tetrys')
+        self.width = width
+        self.height = height
+        self.width_px = (width + 1 + SIDEBAR_WIDTH) * CELL_SIZE
+        self.height_px = height * CELL_SIZE
+        self.display = pygame.display.set_mode((self.width_px, self.height_px), pygame.HWSURFACE | pygame.DOUBLEBUF)
+
+        self.highscore_file = highscore_file
+
+        self.small_font = pygame.font.SysFont(*SMALL_FONT)
+        self.small_font.set_bold(True)
+        self.large_font = pygame.font.SysFont(*LARGE_FONT)
+
+        self.clock = pygame.time.Clock()
+        pygame.key.set_repeat(KEY_FIRST_REPEAT_DELAY, KEY_REPEAT_INTERVAL)
+        self.shadow = pygame.Surface((self.width_px, self.height_px), pl.SRCALPHA)
+        self.shadow.fill(SHADOW_COLOR)
+
+        self.textinput = pygame_textinput.TextInput(text_color=TEXT_HILIGHT_COLOR)
+        self.textinput.font_object = self.small_font # Just override the font_object
+
+        self.cell_images = {t: pygame.image.load(t + '.png').convert_alpha() for t in Tetromino.TYPES}
+        self.cell_images[SEPARATOR_TYPE] = pygame.image.load('sep.png').convert_alpha()
+
+        self.running = True
+        self.space_pressed = False
+        self.show_final = True
+        self.start()
+
+    def start(self):
+        self.state = GameState.READY
+
+        self.locked = [[None] * self.height for _ in range(self.width)]
+
+        self.level = 1
+        self.lines = 0
+        self.score = 0
+
+        self.next = Tetromino()
+        self.pick_next()
+
+        self.reset_drop_timer()
+
+    def on_event(self, event):
+        if event.type == pygame.QUIT:
+            self.running = False
+            return
+
+        if self.state == GameState.READY:
+            if event.type == pl.KEYDOWN:
+                self.state = GameState.RUNNING
+        elif self.state == GameState.PAUSED:
+            if event.type == pl.KEYDOWN:
+                self.toggle_pause()
+        elif self.state == GameState.LOST_HISCORE:
+            if self.textinput.update([event]):
+                self.save_score()
+                self.state = GameState.LOST_DONE
+        elif self.state == GameState.LOST_DONE:
+            if event.type == pl.KEYDOWN:
+                if event.key == pl.K_r:
+                    self.start()
+                    self.state = GameState.RUNNING
+                elif event.key == pl.K_q:
+                    self.running = False
+        elif event.type == pl.KEYDOWN:
+            if event.key == pl.K_RIGHT:
+                self.right()
+            elif event.key == pl.K_LEFT:
+                self.left()
+            elif event.key == pl.K_UP:
+                self.rotate()
+            elif event.key == pl.K_DOWN:
+                self.drop()
+            # We don't want to repeat hard drops
+            elif event.key == pl.K_SPACE and not self.space_pressed:
+                self.space_pressed = True
+                self.hard_drop()
+            elif event.key == pl.K_q:
+                self.running = False
+            elif event.key == pl.K_p:
+                self.toggle_pause()
+            elif event.key == pl.K_g:
+                self.add_garbage()
+            elif event.key == pl.K_f:
+                self.show_final = not self.show_final
+        elif event.type == pl.KEYUP:
+            if event.key == pl.K_SPACE:
+                self.space_pressed = False
+        elif event.type == DROP_EVENT:
+            self.drop()
+
+    def reset_drop_timer(self):
+        pygame.time.set_timer(DROP_EVENT, (11 - self.level) * 50)
+
+    def pick_next(self):
+        self.current = self.next
+        self.next = Tetromino()
+        self.current.x = (self.width - self.current.get_width()) // 2
+        if not self.can_place():
+            self.lose_game()
+        self.reset_drop_timer()
+
+    def lose_game(self):
+        self.load_score()
+        if any(row[-1] for row in self.highscores):
+            self.state = GameState.LOST_HISCORE
+        else:
+            self.state = GameState.LOST_DONE
+
+    def load_score(self):
+        with open(self.highscore_file, 'r') as score_file:
+            reader = csv.reader(score_file)
+            self.highscores = [row + [False] for row in reader]
+        self.highscores.append(['', str(self.level), str(self.lines), str(self.score), True])
+        self.highscores.sort(key=lambda x: -int(x[3]))
+        self.highscores = self.highscores[:10]
+
+    def save_score(self):
+        for row in self.highscores:
+            if row[-1]:
+                row[0] = self.textinput.get_text()
+                break
+
+        with open(self.highscore_file, 'w', newline='') as score_file:
+            writer = csv.writer(score_file)
+            writer.writerows(row[:-1] for row in self.highscores)
+
+    def move(self, dx, dy):
+        self.current.move(dx, dy)
+        if not self.can_place():
+            self.current.move(-dx, -dy)
+            return False
+        return True
+
+    def can_place(self):
+        for x, y in self.current:
+            y = ceil(y)
+            if x < 0 or x >= self.width or y < 0 or y >= self.height or self.locked[x][y]:
+                return False
+        return True
+
+    def update_final_y(self):
+        dy = 0
+        while self.can_place():
+            self.current.move(0, 1)
+            dy += 1
+        self.final_y = ceil(self.current.y - 1)
+        self.current.move(0, -dy)
+
+    def left(self):
+        if self.state != GameState.RUNNING:
+            return
+        self.move(-1, 0)
+
+    def right(self):
+        if self.state != GameState.RUNNING:
+            return
+        self.move(1, 0)
+
+    def rotate(self):
+        if self.state != GameState.RUNNING:
+            return
+        self.current.rotate()
+        if self.can_place():
+            return
+        # Try a wall kick to the left...
+        self.current.move(-1, 0)
+        if self.can_place():
+            return
+        # ...then a wall kick to the right...
+        self.current.move(2, 0)
+        if self.can_place():
+            return
+        # ...didn't work out
+        self.current.rotate(-1)
+        self.current.move(-1, 0)
+
+    def drop(self):
+        if self.state != GameState.RUNNING:
+            return
+        if not self.move(0, 1):
+            self.lock()
+            self.pick_next()
+            self.handle_complete_lines()
+
+    def hard_drop(self):
+        if self.state != GameState.RUNNING:
+            return
+        self.state = GameState.ANIMATING
+        self.last_anim_time = pygame.time.get_ticks()
+
+    def hard_drop_animation(self):
+        if self.state != GameState.ANIMATING:
+            return
+
+        now = pygame.time.get_ticks()
+        delta = (now - self.last_anim_time) / HARD_DROP_ANIMATION_TIME
+        self.last_anim_time = now
+
+        if not self.move(0, 20 * delta) or self.current.y >= self.final_y:
+            self.current.y = self.final_y
+            self.state = GameState.RUNNING
+            self.lock()
+            # The next call could override self.state
+            self.pick_next()
+            self.handle_complete_lines()
+
+    def handle_complete_lines(self):
+        completed = 0
+        for y in range(self.height):
+            if all(self.locked[x][y] for x in range(self.width)):
+                completed += 1
+                for x in range(self.width):
+                    del self.locked[x][y]
+                    self.locked[x].insert(0, None)
+
+        self.lines += completed
+        if completed > 0:
+            self.score += (self.level + 1) * POINTS_FOR_LINES[completed - 1]
+        self.level = min(10, 1 + self.lines // 10)
+
+    def lock(self):
+        for x, y in self.current:
+            y = ceil(y)
+            self.locked[x][y] = self.current.type
+        self.current = None
+
+    def add_garbage(self):
+        if self.state != GameState.RUNNING:
+            return
+
+        for x in range(self.width):
+            del self.locked[x][0]
+            filler = random.choice([None, random.choice(Tetromino.TYPES)])
+            self.locked[x].append(filler)
+
+        self.score += 100
+
+    def toggle_pause(self):
+        if self.state == GameState.RUNNING:
+            self.state = GameState.PAUSED
+        elif self.state == GameState.PAUSED:
+            self.state = GameState.RUNNING
+
+    def on_loop(self):
+        self.update_final_y()
+        self.hard_drop_animation()
+
+    def on_render(self):
+        self.clock.tick(FPS)
+
+        self.display.fill((0, 0, 0))
+
+        for x in range(self.width):
+            for y in range(self.height):
+                what = self.locked[x][y] or EMPTY_CELL_COLOR
+                self.draw_cell((x, y), what)
+
+        if self.show_final:
+            for x, y in self.current:
+                self.draw_cell((x, int(y - self.current.y + self.final_y)), FINAL_POSITION_COLOR)
+
+        for cell in self.current:
+            self.draw_cell(cell, self.current.type)
+
+        center_x = (self.width + 1 + SIDEBAR_WIDTH / 2) * CELL_SIZE
+        self.display_text(self.small_font, 'NEXT', center_x, CELL_SIZE)
+
+        for cell in self.next:
+            self.draw_cell(cell, self.next.type,
+                           self.width + 1 + (SIDEBAR_WIDTH - self.next.get_width()) / 2,
+                           1 + (4 - self.next.get_height()) / 2)
+
+        for y in range(self.height):
+            self.draw_cell((self.width, y), SEPARATOR_TYPE)
+
+        for y in (5, 10, 15):
+            for x in range(SIDEBAR_WIDTH):
+                self.draw_cell((x + self.width + 1, y), SEPARATOR_TYPE)
+
+        self.display_text(self.small_font, 'LEVEL',
+                          center_x, 7 * CELL_SIZE)
+        self.display_text(self.large_font, str(self.level),
+                          center_x, 7 * CELL_SIZE + 40)
+        self.display_text(self.small_font, 'LINES',
+                          center_x, 12 * CELL_SIZE)
+        self.display_text(self.large_font, str(self.lines),
+                          center_x, 12 * CELL_SIZE + 40)
+        self.display_text(self.small_font, 'SCORE',
+                          center_x, 17 * CELL_SIZE)
+        self.display_text(self.large_font, str(self.score),
+                          center_x, 17 * CELL_SIZE + 40)
+
+        if self.state == GameState.READY:
+            self.display.blit(self.shadow, (0, 0))
+            self.display.blit(self.shadow, (0, 0))
+            self.display_text(self.large_font, 'TETRYS',
+                              self.width_px / 2, self.height_px / 2 - 25)
+            self.display_text(self.small_font, 'PRESS ANY KEY TO START',
+                              self.width_px / 2, self.height_px / 2 + 25)
+        if self.state == GameState.PAUSED:
+            self.display.blit(self.shadow, (0, 0))
+            self.display_text(self.large_font, 'PAUSED',
+                              self.width_px / 2, self.height_px / 2 - 25)
+            self.display_text(self.small_font, 'PRESS ANY KEY TO CONTINUE',
+                              self.width_px / 2, self.height_px / 2 + 25)
+        if self.state in (GameState.LOST_HISCORE, GameState.LOST_DONE):
+            self.render_lost_game()
+
+        pygame.display.flip()
+
+    def render_lost_game(self):
+        self.display.blit(self.shadow, (0, 0))
+        self.display.blit(self.shadow, (0, 0))
+        self.display_text(self.large_font, 'GAME OVER', self.width_px / 2, 50)
+        if self.state == GameState.LOST_HISCORE:
+            self.display_text(self.small_font, 'ENTER YOUR NAME', self.width_px / 2, 50 + 50)
+        else:
+            self.display_text(self.small_font, 'PRESS "R" TO RESTART, "Q" TO QUIT', self.width_px / 2, 50 + 50)
+
+        headline = ['NAME', 'LEVEL', 'LINES', 'SCORE', False]
+        for i, (name, level, lines, score, new_score) in enumerate([headline] + self.highscores):
+            y = 150 + i * 25
+            if i > 0:
+                y += 25
+            color = TEXT_HILIGHT_COLOR if new_score else TEXT_COLOR
+            if new_score and self.state == GameState.LOST_HISCORE:
+                self.display.blit(self.textinput.get_surface(), (self.width_px / 2 - 200, y))
+            else:
+                self.display_text(self.small_font, name, self.width_px / 2 - 200, y, where='left', color=color)
+            self.display_text(self.small_font, level, self.width_px / 2, y, where='right', color=color)
+            self.display_text(self.small_font, lines, self.width_px / 2 + 100, y, where='right', color=color)
+            self.display_text(self.small_font, score, self.width_px / 2 + 200, y, where='right', color=color)
+
+    def display_text(self, font, text, x, y, where='center', color=TEXT_COLOR):
+        text_surface = font.render(text, True, color)
+        rect = text_surface.get_rect()
+        if where == 'center':
+            rect.left = x - rect.width / 2
+            rect.top = y - rect.height / 2
+        elif where == 'left':
+            rect.left = x
+            rect.top = y
+        elif where == 'right':
+            rect.right = x
+            rect.top = y
+        self.display.blit(text_surface, rect)
+
+    def draw_cell(self, cell, what, x_offset=0, y_offset=0):
+        x, y = cell
+        x, y = x + x_offset, y + y_offset
+        if what in self.cell_images:
+            self.display.blit(self.cell_images[what], (x * CELL_SIZE + 1, y * CELL_SIZE + 1))
+        else:
+            r = pygame.Rect(CELL_SIZE * x + 1, CELL_SIZE * y + 1, CELL_SIZE - 1, CELL_SIZE - 1)
+            pygame.draw.rect(self.display, what, r)
+
+    def mainloop(self):
+        while self.running:
+            for event in pygame.event.get():
+                self.on_event(event)
+            self.on_loop()
+            self.on_render()
+        pygame.quit()
+
+if __name__ == "__main__":
+    parser = OptionParser()
+    parser.add_option('--width', type='int', default=WIDTH, help='width')
+    parser.add_option('--height', type='int', default=HEIGHT, help='height')
+    parser.add_option('-f', default=HIGHSCORE_FILE, help='highscore file')
+    (options, args) = parser.parse_args()
+
+    game = Game(width=options.width, height=options.height, highscore_file=options.f)
+    game.mainloop()
